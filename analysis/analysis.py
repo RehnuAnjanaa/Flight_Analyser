@@ -1,3 +1,4 @@
+name=analysis/analysis.py
 #!/usr/bin/env python3
 """
 analysis.py
@@ -13,6 +14,7 @@ Outputs:
   - A simple CSV summary saved to ./analysis/results/feature_importances.csv
 """
 import os
+import sys
 import argparse
 from typing import Optional
 
@@ -24,11 +26,10 @@ import seaborn as sns
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import r2_score, mean_squared_error
-from sklearn.inspection import permutation_importance
 
 # Default raw URL (reads from your repository root)
 RAW_URL = "https://raw.githubusercontent.com/RehnuAnjanaa/EliteHeaven/main/flight_pricing_dataset.csv"
@@ -42,9 +43,15 @@ def load_data(path: Optional[str] = None) -> pd.DataFrame:
     if path is None:
         path = RAW_URL
     print(f"Loading data from: {path}")
-    df = pd.read_csv(path, low_memory=False)
-    print("Loaded rows,cols:", df.shape)
-    return df
+    try:
+        df = pd.read_csv(path, low_memory=False)
+        print(f"Loaded {len(df)} rows, {len(df.columns)} cols")
+        if len(df) == 0:
+            raise ValueError("Dataset is empty!")
+        return df
+    except Exception as e:
+        print(f"ERROR loading data: {e}")
+        sys.exit(1)
 
 def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     # Normalize column names for common variants
@@ -89,28 +96,31 @@ def parse_dates_and_features(df: pd.DataFrame) -> pd.DataFrame:
             df["journey_month"] = df["date_of_journey"].dt.month
             df["journey_day"] = df["date_of_journey"].dt.day
             df["is_weekend"] = df["journey_weekday"].isin(["Saturday", "Sunday"])
-        except Exception:
-            # if parsing fails, skip
-            pass
+        except Exception as e:
+            print(f"Warning: Could not parse date_of_journey: {e}")
 
     # Booking date -> days_to_departure
     if "booking_date" in df.columns and "date_of_journey" in df.columns:
         try:
             df["booking_date"] = pd.to_datetime(df["booking_date"], dayfirst=True, errors="coerce")
             df["days_to_departure"] = (df["date_of_journey"] - df["booking_date"]).dt.days
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Warning: Could not compute days_to_departure: {e}")
 
     # Parse departure and arrival times (if present)
     for col in ("dep_time", "departure_time"):
         if col in df.columns:
-            df["dep_time_parsed"] = pd.to_datetime(df[col], format="%H:%M", errors="coerce").dt.time
-            # hour
-            df["dep_hour"] = pd.to_datetime(df[col], format="%H:%M", errors="coerce").dt.hour
-            break
+            try:
+                df["dep_hour"] = pd.to_datetime(df[col], format="%H:%M", errors="coerce").dt.hour
+                break
+            except Exception as e:
+                print(f"Warning: Could not parse {col}: {e}")
 
     if "arrival_time" in df.columns:
-        df["arr_hour"] = pd.to_datetime(df["arrival_time"], format="%H:%M", errors="coerce").dt.hour
+        try:
+            df["arr_hour"] = pd.to_datetime(df["arrival_time"], format="%H:%M", errors="coerce").dt.hour
+        except Exception as e:
+            print(f"Warning: Could not parse arrival_time: {e}")
 
     # Duration parsing (e.g., "2h 50m" or "2h")
     if "duration" in df.columns:
@@ -165,6 +175,7 @@ def parse_dates_and_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # Sanity: drop rows with missing price
     df = df[~df["price"].isna()].copy()
+    print(f"After feature engineering: {len(df)} rows with valid price")
 
     return df
 
@@ -223,6 +234,8 @@ def plot_price_vs_days_to_departure(df: pd.DataFrame):
     if "days_to_departure" not in df.columns:
         return
     dfsub = df[df["days_to_departure"].notna()].copy()
+    if len(dfsub) == 0:
+        return
     fig, ax = plt.subplots(figsize=(10, 5))
     sns.scatterplot(data=dfsub.sample(frac=min(1, 10000/len(dfsub)), random_state=1), x="days_to_departure", y="price", alpha=0.2, ax=ax)
     med = dfsub.groupby("days_to_departure")["price"].median().reset_index()
@@ -275,107 +288,168 @@ def prepare_modeling_data(df: pd.DataFrame, max_cat_top=12):
 
     # Candidate categorical features (common ones)
     cat_candidates = [c for c in ["airline", "source", "destination", "route", "journey_weekday"] if c in df.columns]
-    num_candidates = [c for c in ["duration_mins", "dep_hour", "arr_hour", "days_to_departure", "stops"] if c in df.columns]
+    num_candidates = [c for c in ["duration_mins", "dep_hour", "arr_hour", "days_to_departure", "stops", "journey_month"] if c in df.columns]
+
+    print(f"Available categorical features: {cat_candidates}")
+    print(f"Available numeric features: {num_candidates}")
 
     # Create X with these columns
     X = pd.DataFrame()
+    
+    # Add numeric features
     for c in num_candidates:
-        X[c] = df[c].astype(float)
+        X[c] = pd.to_numeric(df[c], errors="coerce").fillna(df[c].median() if df[c].notna().any() else 0)
 
+    # Add categorical features
     for c in cat_candidates:
         ser = df[c].astype(str).fillna("NA")
-        top = ser.value_counts().index[:max_cat_top]
+        top = ser.value_counts().nlargest(max_cat_top).index
         X[c] = ser.where(ser.isin(top), other="Other")
+
+    print(f"Features prepared: {X.shape[1]} total features")
+    print(f"Feature columns: {X.columns.tolist()}")
+
+    if X.shape[1] == 0:
+        print("WARNING: No features available for modeling!")
+        return X, y, cat_candidates, num_candidates
+
+    if len(X) == 0:
+        print("WARNING: No samples available for modeling!")
+        return X, y, cat_candidates, num_candidates
 
     return X, y, cat_candidates, num_candidates
 
 def train_feature_importance(X: pd.DataFrame, y: np.ndarray, cat_cols, num_cols):
-    # Preprocessing
-    numeric_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median"))
-    ])
-    categorical_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="constant", fill_value="NA")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
-    ])
+    try:
+        print(f"Training data shape: X={X.shape}, y={y.shape}")
+        print(f"Numeric cols: {num_cols}")
+        print(f"Categorical cols: {cat_cols}")
+        
+        # Handle empty feature set
+        if X.shape[1] == 0:
+            print("ERROR: No features available for model training")
+            return None, None
 
-    preprocessor = ColumnTransformer(transformers=[
-        ("num", numeric_transformer, num_cols),
-        ("cat", categorical_transformer, cat_cols)
-    ], remainder="drop")
+        # Preprocessing
+        numeric_transformer = Pipeline(steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler())
+        ]) if num_cols else "passthrough"
 
-    model = Pipeline(steps=[
-        ("pre", preprocessor),
-        ("rf", RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1))
-    ])
+        categorical_transformer = Pipeline(steps=[
+            ("imputer", SimpleImputer(strategy="constant", fill_value="NA")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False, max_categories=50))
+        ]) if cat_cols else "passthrough"
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    print("Training RandomForest...")
-    model.fit(X_train, y_train)
-    preds = model.predict(X_test)
-    print("R2:", r2_score(y_test, preds), "RMSE:", mean_squared_error(y_test, preds, squared=False))
+        transformers = []
+        if num_cols:
+            transformers.append(("num", numeric_transformer, num_cols))
+        if cat_cols:
+            transformers.append(("cat", categorical_transformer, cat_cols))
 
-    # Permutation importance (gives feature importances on original columns after preprocessing)
-    print("Computing permutation importances...")
-    r = permutation_importance(model, X_test, y_test, n_repeats=10, random_state=42, n_jobs=-1, scoring="neg_mean_squared_error")
+        if not transformers:
+            print("ERROR: No transformers configured")
+            return None, None
 
-    # build feature names
-    # numeric names first, then onehot feature names
-    transformed_feature_names = []
-    if hasattr(model.named_steps["pre"], "get_feature_names_out"):
-        # column transformer get_feature_names_out (sklearn >=1.0)
+        preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
+
+        model = Pipeline(steps=[
+            ("pre", preprocessor),
+            ("rf", RandomForestRegressor(n_estimators=100, max_depth=15, random_state=42, n_jobs=-1, verbose=1))
+        ])
+
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        print(f"Training set: {X_train.shape[0]}, Test set: {X_test.shape[0]}")
+
+        print("Training RandomForest...")
+        model.fit(X_train, y_train)
+        
+        print("Making predictions...")
+        preds = model.predict(X_test)
+        
+        r2 = r2_score(y_test, preds)
+        rmse = mean_squared_error(y_test, preds, squared=False)
+        print(f"R2: {r2:.4f}, RMSE: {rmse:.2f}")
+
+        # Get feature names
+        print("Computing feature importances...")
+        transformed_feature_names = []
         try:
-            transformed_feature_names = model.named_steps["pre"].get_feature_names_out()
-        except Exception:
-            transformed_feature_names = None
+            transformed_feature_names = list(model.named_steps["pre"].get_feature_names_out())
+        except Exception as e:
+            print(f"Warning: Could not get feature names: {e}")
+            transformed_feature_names = num_cols.copy()
+            if cat_cols:
+                transformed_feature_names += [f"{c}_cat_{i}" for c in cat_cols for i in range(50)]
 
-    if transformed_feature_names is None or len(transformed_feature_names) == 0:
-        # Fallback: construct names manually
-        ohe = model.named_steps["pre"].named_transformers_["cat"].named_steps["onehot"]
-        ohe_cats = []
-        try:
-            for cats in ohe.categories_:
-                ohe_cats.extend([f"{cat}" for cat in cats])
-        except Exception:
-            ohe_cats = []
-        transformed_feature_names = list(num_cols) + ohe_cats
+        # Get feature importances
+        rf_model = model.named_steps["rf"]
+        importances = rf_model.feature_importances_
 
-    importances = pd.Series(r.importances_mean, index=transformed_feature_names).sort_values(ascending=False)
-    imp_df = importances.reset_index()
-    imp_df.columns = ["feature", "importance"]
-    imp_df.to_csv(os.path.join(RESULTS_DIR, "feature_importances.csv"), index=False)
+        if len(importances) != len(transformed_feature_names):
+            print(f"Warning: feature count mismatch ({len(importances)} vs {len(transformed_feature_names)})")
+            # Truncate to match
+            importances = importances[:len(transformed_feature_names)]
 
-    # Plot top features
-    topk = imp_df.head(25)
-    fig, ax = plt.subplots(figsize=(10, 8))
-    sns.barplot(data=topk, y="feature", x="importance", ax=ax)
-    ax.set_title("Top features by permutation importance (RandomForest)")
-    fig.savefig(os.path.join(PLOTS_DIR, "feature_importances.png"), bbox_inches="tight")
-    plt.close(fig)
+        imp_series = pd.Series(importances, index=transformed_feature_names).sort_values(ascending=False)
+        imp_df = imp_series.reset_index()
+        imp_df.columns = ["feature", "importance"]
+        imp_df.to_csv(os.path.join(RESULTS_DIR, "feature_importances.csv"), index=False)
+        print(f"Feature importances saved to {RESULTS_DIR}/feature_importances.csv")
 
-    return model, imp_df
+        # Plot top features
+        topk = imp_df.head(25)
+        fig, ax = plt.subplots(figsize=(10, 8))
+        sns.barplot(data=topk, y="feature", x="importance", ax=ax)
+        ax.set_title("Top features by importance (RandomForest)")
+        fig.savefig(os.path.join(PLOTS_DIR, "feature_importances.png"), bbox_inches="tight")
+        plt.close(fig)
+
+        return model, imp_df
+
+    except Exception as e:
+        print(f"ERROR during model training: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
 
 def main(args):
-    df = load_data(args.input if args.input else None)
-    df = canonicalize_columns(df)
-    df = parse_dates_and_features(df)
-    # Basic overview
-    print("Columns:", df.columns.tolist())
-    print("Sample:")
-    print(df.head(3).T)
+    try:
+        df = load_data(args.input if args.input else None)
+        df = canonicalize_columns(df)
+        df = parse_dates_and_features(df)
+        
+        # Basic overview
+        print("\n=== Dataset Overview ===")
+        print(f"Columns: {df.columns.tolist()}")
+        print(f"Shape: {df.shape}")
+        print(f"Sample:\n{df.head(3).T}\n")
 
-    # Generate plots
-    generate_all_plots(df)
+        # Generate plots
+        print("=== Generating Plots ===")
+        generate_all_plots(df)
 
-    # Modeling + feature importances
-    X, y, cat_cols, num_cols = prepare_modeling_data(df)
-    if X.shape[1] > 0:
-        model, imp_df = train_feature_importance(X, y, cat_cols, num_cols)
-        print("Top importances:\n", imp_df.head(15))
-    else:
-        print("Not enough features for modeling.")
+        # Modeling + feature importances
+        print("\n=== Model Training ===")
+        X, y, cat_cols, num_cols = prepare_modeling_data(df)
+        if X.shape[1] > 0 and len(X) > 0:
+            model, imp_df = train_feature_importance(X, y, cat_cols, num_cols)
+            if imp_df is not None:
+                print("\nTop 15 importances:")
+                print(imp_df.head(15))
+        else:
+            print("Not enough features for modeling.")
 
-    print("All done. Plots in:", PLOTS_DIR, "Results in:", RESULTS_DIR)
+        print(f"\n=== Complete ===")
+        print(f"Plots saved to: {PLOTS_DIR}")
+        print(f"Results saved to: {RESULTS_DIR}")
+
+    except Exception as e:
+        print(f"FATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
