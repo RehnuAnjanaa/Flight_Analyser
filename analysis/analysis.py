@@ -296,7 +296,7 @@ def train_feature_importance(X: pd.DataFrame, y: np.ndarray, cat_cols, num_cols)
     ])
     categorical_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="constant", fill_value="NA")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse=False))
+        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
     ])
 
     preprocessor = ColumnTransformer(transformers=[
